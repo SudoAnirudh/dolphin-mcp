@@ -116,38 +116,59 @@ class MCPClient:
 
     async def _receive_loop(self):
         if not self.process or self.process.stdout.at_eof():
+            logger.error(f"Server {self.server_name}: Process not started or stdout closed")
             return
         try:
-            while not self.process.stdout.at_eof():
-                line = await self.process.stdout.readline()
-                if not line:
-                    break
+            while not self.process.stdout.at_eof() and not self._shutdown:
                 try:
-                    message = json.loads(line.decode().strip())
-                    self._process_message(message)
-                except json.JSONDecodeError:
-                    pass
-        except Exception:
-            pass
+                    line = await self.process.stdout.readline()
+                    if not line:
+                        logger.warning(f"Server {self.server_name}: Empty line received, breaking loop")
+                        break
+                    
+                    try:
+                        message = json.loads(line.decode().strip())
+                        await self._process_message(message)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Server {self.server_name}: JSON decode error: {str(e)}, raw: {line}")
+                    except UnicodeDecodeError as e:
+                        logger.error(f"Server {self.server_name}: Unicode decode error: {str(e)}")
+                except asyncio.CancelledError:
+                    logger.info(f"Server {self.server_name}: Receive loop cancelled")
+                    break
+                except Exception as e:
+                    logger.error(f"Server {self.server_name}: Error processing message: {str(e)}")
+                    
+        except Exception as e:
+            logger.error(f"Server {self.server_name}: Fatal error in receive loop: {str(e)}")
+            if self.process:
+                stderr_data = await self.process.stderr.read()
+                if stderr_data:
+                    logger.error(f"Server {self.server_name} stderr: {stderr_data.decode()}")
+        finally:
+            logger.info(f"Server {self.server_name}: Receive loop terminated")
 
-    def _process_message(self, message: dict):
-        if "jsonrpc" in message and "id" in message:
-            if "result" in message or "error" in message:
-                self.responses[message["id"]] = message
-            else:
-                # request from server, not implemented
-                resp = {
-                    "jsonrpc": "2.0",
-                    "id": message["id"],
-                    "error": {
-                        "code": -32601,
-                        "message": f"Method {message.get('method')} not implemented in client"
+    async def _process_message(self, message: dict):
+        try:
+            if "jsonrpc" in message and "id" in message:
+                if "result" in message or "error" in message:
+                    self.responses[message["id"]] = message
+                else:
+                    # request from server, not implemented
+                    resp = {
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "error": {
+                            "code": -32601,
+                            "message": f"Method {message.get('method')} not implemented in client"
+                        }
                     }
-                }
-                asyncio.create_task(self._send_message(resp))
-        elif "jsonrpc" in message and "method" in message and "id" not in message:
-            # notification from server
-            pass
+                    await self._send_message(resp)
+            elif "jsonrpc" in message and "method" in message and "id" not in message:
+                # notification from server
+                logger.debug(f"Server {self.server_name}: Received notification: {message.get('method')}")
+        except Exception as e:
+            logger.error(f"Server {self.server_name}: Error processing message: {str(e)}")
 
     async def start(self):
         expanded_args = []
@@ -317,35 +338,59 @@ class MCPClient:
 #################################
 # Generation: OpenAI, Anthropic, Ollama
 #################################
-async def generate_with_openai(conversation, model_cfg, all_functions):
-    from openai import OpenAI, APIError, RateLimitError
-    import os
-
-    api_key = model_cfg.get("apiKey") or os.getenv("OPENAI_API_KEY")
-    if "apiBase" in model_cfg:
-        client = OpenAI(api_key=api_key, base_url=model_cfg["apiBase"])
-    else:
-        client = OpenAI(api_key=api_key)
-
-    model_name = model_cfg["model"]
-    temperature = model_cfg.get("temperature", None)
-    top_p = model_cfg.get("top_p", None)
-    max_tokens = model_cfg.get("max_tokens", None)
-
-    loop = asyncio.get_event_loop()
-
-    def do_openai_sync():
-        return client.chat.completions.create(
-            model=model_name,
-            messages=conversation,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            functions=all_functions,
-            function_call="auto"
-        )
+async def generate_text(conversation, model_cfg, all_functions):
+    if not isinstance(model_cfg, dict):
+        return {"assistant_text": "Invalid model configuration: configuration must be a dictionary", "tool_calls": []}
+        
+    provider = model_cfg.get("provider", "").lower()
+    if not provider:
+        return {"assistant_text": "Invalid model configuration: provider is required", "tool_calls": []}
+        
+    if "model" not in model_cfg:
+        return {"assistant_text": "Invalid model configuration: model name is required", "tool_calls": []}
 
     try:
+        if provider == "openai":
+            return await generate_with_openai(conversation, model_cfg, all_functions)
+        elif provider == "anthropic":
+            return await generate_with_anthropic(conversation, model_cfg, all_functions)
+        elif provider == "ollama":
+            return await generate_with_ollama(conversation, model_cfg, all_functions)
+        else:
+            return {"assistant_text": f"Unsupported provider '{provider}'. Supported providers are: openai, anthropic, ollama", "tool_calls": []}
+    except Exception as e:
+        logger.error(f"Error generating text with {provider}: {str(e)}")
+        return {"assistant_text": f"Error generating text with {provider}: {str(e)}", "tool_calls": []}
+
+async def generate_with_openai(conversation, model_cfg, all_functions):
+    try:
+        api_key = model_cfg.get("apiKey") or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OpenAI API key not found in configuration or environment")
+
+        if "apiBase" in model_cfg:
+            client = OpenAI(api_key=api_key, base_url=model_cfg["apiBase"])
+        else:
+            client = OpenAI(api_key=api_key)
+
+        model_name = model_cfg["model"]
+        temperature = model_cfg.get("temperature", 0.7)  # Default temperature
+        top_p = model_cfg.get("top_p", 1.0)  # Default top_p
+        max_tokens = model_cfg.get("max_tokens", 2048)  # Default max_tokens
+
+        loop = asyncio.get_event_loop()
+
+        def do_openai_sync():
+            return client.chat.completions.create(
+                model=model_name,
+                messages=conversation,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                functions=all_functions,
+                function_call="auto"
+            )
+
         resp = await loop.run_in_executor(None, do_openai_sync)
         choice = resp.choices[0]
         assistant_text = choice.message.content or ""
@@ -362,27 +407,33 @@ async def generate_with_openai(conversation, model_cfg, all_functions):
         return {"assistant_text": assistant_text, "tool_calls": tool_calls}
 
     except APIError as e:
+        logger.error(f"OpenAI API error: {str(e)}")
         return {"assistant_text": f"OpenAI API error: {str(e)}", "tool_calls": []}
     except RateLimitError as e:
+        logger.error(f"OpenAI rate limit: {str(e)}")
         return {"assistant_text": f"OpenAI rate limit: {str(e)}", "tool_calls": []}
+    except ValueError as e:
+        logger.error(f"OpenAI configuration error: {str(e)}")
+        return {"assistant_text": str(e), "tool_calls": []}
     except Exception as e:
+        logger.error(f"Unexpected OpenAI error: {str(e)}")
         return {"assistant_text": f"Unexpected OpenAI error: {str(e)}", "tool_calls": []}
 
 
 async def generate_with_anthropic(conversation, model_cfg, all_functions):
-    from anthropic import AsyncAnthropic, APIError as AnthropicAPIError
-    import os
-
-    anthro_api_key = model_cfg.get("apiKey", os.getenv("ANTHROPIC_API_KEY"))
-    client = AsyncAnthropic(api_key=anthro_api_key)
-
-    model_name = model_cfg["model"]
-    temperature = model_cfg.get("temperature", 0.7)
-    top_k = model_cfg.get("top_k", None)
-    top_p = model_cfg.get("top_p", None)
-    max_tokens = model_cfg.get("max_tokens", 1024)
-
     try:
+        anthro_api_key = model_cfg.get("apiKey") or os.getenv("ANTHROPIC_API_KEY")
+        if not anthro_api_key:
+            raise ValueError("Anthropic API key not found in configuration or environment")
+
+        client = AsyncAnthropic(api_key=anthro_api_key)
+
+        model_name = model_cfg["model"]
+        temperature = model_cfg.get("temperature", 0.7)
+        top_k = model_cfg.get("top_k", None)
+        top_p = model_cfg.get("top_p", None)
+        max_tokens = model_cfg.get("max_tokens", 1024)
+
         create_resp = await client.messages.create(
             model=model_name,
             messages=conversation,
@@ -395,9 +446,14 @@ async def generate_with_anthropic(conversation, model_cfg, all_functions):
         return {"assistant_text": assistant_text, "tool_calls": []}
 
     except AnthropicAPIError as e:
+        logger.error(f"Anthropic API error: {str(e)}")
         return {"assistant_text": f"Anthropic error: {str(e)}", "tool_calls": []}
+    except ValueError as e:
+        logger.error(f"Anthropic configuration error: {str(e)}")
+        return {"assistant_text": str(e), "tool_calls": []}
     except Exception as e:
-        return {"assistant_text": f"Unexpected Anthropics error: {str(e)}", "tool_calls": []}
+        logger.error(f"Unexpected Anthropic error: {str(e)}")
+        return {"assistant_text": f"Unexpected Anthropic error: {str(e)}", "tool_calls": []}
 
 
 async def generate_with_ollama(conversation, model_cfg, all_functions):
@@ -426,18 +482,6 @@ async def generate_with_ollama(conversation, model_cfg, all_functions):
         return {"assistant_text": f"Ollama error: {str(e)}", "tool_calls": []}
     except Exception as e:
         return {"assistant_text": f"Unexpected Ollama error: {str(e)}", "tool_calls": []}
-
-
-async def generate_text(conversation, model_cfg, all_functions):
-    provider = model_cfg.get("provider", "").lower()
-    if provider == "openai":
-        return await generate_with_openai(conversation, model_cfg, all_functions)
-    elif provider == "anthropic":
-        return await generate_with_anthropic(conversation, model_cfg, all_functions)
-    elif provider == "ollama":
-        return await generate_with_ollama(conversation, model_cfg, all_functions)
-    else:
-        return {"assistant_text": f"Unsupported provider '{provider}'", "tool_calls": []}
 
 ######################################################################
 # The main library function
